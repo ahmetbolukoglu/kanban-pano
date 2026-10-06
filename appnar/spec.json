@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "Kanban Pano",
+  "slug": "kanban-pano",
+  "category": "productivity",
+  "description": "Sürükle-bırak sütunlarla görevlerini yapılacak, sürüyor ve bitti olarak yönet.",
+  "features": [
+    "Sütunlar arası sürükle-bırak",
+    "Etiket ve öncelik",
+    "Son tarih uyarısı",
+    "Arama ve filtre",
+    "JSON dışa/içe aktarma",
+    "Sesli bildirim",
+    "Gündem şablonu",
+    "Günlük ve haftalık istatistik"
+  ],
+  "language": "tr",
+  "accent": "#a78bfa",
+  "revision": 1,
+  "requestedAt": "2026-10-06T09:37:26.525Z"
+}

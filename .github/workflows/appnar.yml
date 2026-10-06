@@ -1,0 +1,65 @@
+# AppNar Factory — builds this app with AI inside your own GitHub account.
+# Runs when appnar/spec.json changes (AppNar pushes it) or on manual dispatch.
+# AI: GitHub Models via this workflow's GITHUB_TOKEN. Add a GEMINI_API_KEY
+# repository secret to use Gemini instead.
+name: AppNar Factory
+
+on:
+  push:
+    branches: [main]
+    paths: [appnar/spec.json]
+  workflow_dispatch:
+
+concurrency:
+  group: appnar-factory
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  models: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Uygulamayı üret
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - name: Hazırlık
+        uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Git kimliği
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+      - name: Plan çıkarılıyor
+        run: node appnar/generate.mjs plan
+      - name: Mantık ve testler yazılıyor
+        run: node appnar/generate.mjs logic
+      - name: Arayüz tasarlanıyor
+        run: node appnar/generate.mjs ui
+      - name: Dokümantasyon yazılıyor
+        run: node appnar/generate.mjs docs
+      - name: Kalite kontrolü
+        run: node appnar/generate.mjs verify
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Canlı demo yayınlanıyor
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
