@@ -1,7 +1,8 @@
 # AppNar Factory — builds this app with AI inside your own GitHub account.
 # Runs when appnar/spec.json changes (AppNar pushes it) or on manual dispatch.
-# AI: GitHub Models via this workflow's GITHUB_TOKEN. Add a GEMINI_API_KEY
-# repository secret to use Gemini instead.
+# AI: your own Gemini or Groq key, fetched from AppNar at run time with this
+# workflow's OIDC token (nothing is stored here). An AI_API_KEY repository
+# secret (plus optional AI_PROVIDER variable) overrides it.
 name: AppNar Factory
 
 on:
@@ -16,7 +17,6 @@ concurrency:
 
 permissions:
   contents: write
-  models: read
   pages: write
   id-token: write
 
@@ -26,12 +26,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      AI_API_KEY: ${{ secrets.AI_API_KEY }}
+      AI_PROVIDER: ${{ vars.AI_PROVIDER }}
     steps:
       - name: Hazırlık
-        uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+        uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - name: Git kimliği
@@ -49,7 +49,7 @@ jobs:
       - name: Kalite kontrolü
         run: node appnar/generate.mjs verify
       - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: dist
 

@@ -3,9 +3,10 @@
 //   node appnar/generate.mjs <plan|logic|ui|docs|verify>
 //
 // Each phase calls a language model, writes files, checks them and commits.
-// Models: GitHub Models through the workflow's own GITHUB_TOKEN
-// (permissions: models: read). If the repo has a GEMINI_API_KEY secret, Gemini
-// is used instead. Zero dependencies; Node 22+.
+// The AI key is the repo owner's own (Gemini or Groq). It is fetched at run
+// time from AppNar with this workflow's GitHub OIDC token, so no secret is
+// stored in the repository. An AI_API_KEY repository secret overrides that.
+// Zero dependencies; Node 22+.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -17,66 +18,148 @@ const MAX_FIX_ROUNDS = 3;
 
 // ───────────────────────────── model access ─────────────────────────────
 
-export function providerFromEnv(env = process.env) {
-  if (env.GEMINI_API_KEY) {
-    return {
-      name: 'gemini',
-      url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
-      key: env.GEMINI_API_KEY,
-      models: ['gemini-2.5-flash', 'gemini-2.0-flash'],
-      maxTokens: 8000,
-    };
+const PROVIDERS = {
+  gemini: {
+    url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+    models: ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.0-flash'],
+    maxTokens: 16000,
+    extra: { reasoning_effort: 'low' },
+    gapMs: 6500, // free tier: about 10 requests per minute
+  },
+  groq: {
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    models: ['llama-3.3-70b-versatile', 'openai/gpt-oss-120b'],
+    maxTokens: 8000,
+    extra: {},
+    gapMs: 2500,
+  },
+};
+
+export function makeProvider(name, key) {
+  const def = PROVIDERS[name];
+  if (!def) throw new Error(`unknown AI provider "${name}"`);
+  if (!key) throw new Error(`no API key for ${name}`);
+  return { name, key, ...def };
+}
+
+/**
+ * Finds the AI keys: a repo secret first, otherwise ask AppNar with an OIDC
+ * token. Returns the primary provider; any others ride along as `fallbacks`.
+ */
+export async function resolveProvider(spec, env = process.env, fetcher = fetch) {
+  if (env.AI_API_KEY) return makeProvider(env.AI_PROVIDER || 'gemini', env.AI_API_KEY);
+  if (env.GEMINI_API_KEY) return makeProvider('gemini', env.GEMINI_API_KEY);
+  if (!spec.keyEndpoint) throw new Error('No AI key: set an AI_API_KEY repository secret or rebuild from AppNar.');
+  if (!env.ACTIONS_ID_TOKEN_REQUEST_URL || !env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
+    throw new Error('No OIDC token available: the workflow needs `permissions: id-token: write`.');
   }
-  if (!env.GITHUB_TOKEN) throw new Error('GITHUB_TOKEN is missing. Add `permissions: models: read` and pass secrets.GITHUB_TOKEN.');
-  return {
-    name: 'github-models',
-    url: 'https://models.github.ai/inference/chat/completions',
-    key: env.GITHUB_TOKEN,
-    models: ['openai/gpt-4.1-mini', 'openai/gpt-4o-mini'],
-    maxTokens: 4000,
-  };
+  const oidcRes = await fetcher(`${env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=appnar`, {
+    headers: { Authorization: `Bearer ${env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+  });
+  if (!oidcRes.ok) throw new Error(`could not get an OIDC token: HTTP ${oidcRes.status}`);
+  const { value } = await oidcRes.json();
+  const res = await fetcher(spec.keyEndpoint, { method: 'POST', headers: { Authorization: `Bearer ${value}` } });
+  if (res.status === 404) {
+    throw new Error('Your AppNar account has no AI key yet. Add one in AppNar → Settings → AI, then press "Rebuild".');
+  }
+  if (!res.ok) throw new Error(`AppNar key service answered HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const body = await res.json();
+  const keys = Array.isArray(body.keys) && body.keys.length ? body.keys : [{ provider: body.provider, apiKey: body.apiKey }];
+  if (env.GITHUB_ACTIONS) for (const k of keys) console.log(`::add-mask::${k.apiKey}`);
+  const [primary, ...rest] = keys.map((k) => makeProvider(k.provider, k.apiKey));
+  return { ...primary, fallbacks: rest };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** One chat completion with retry on rate limits and fallback across models. */
+/** Polite pause between calls so free-tier rate limits are not hit. */
+const pause = (provider) => sleep(provider.gapMs ?? 4000);
+
+/** A 429 that will not clear by waiting: the daily free quota is used up. */
+export function isDailyQuota(body) {
+  return /PerDay|per day|daily/i.test(body);
+}
+
+/** Seconds the provider asks us to wait ("retry-after" header or Gemini's retryDelay). */
+function retryAfter(res, body, attempt) {
+  const header = Number(res.headers.get('retry-after'));
+  if (header > 0) return header;
+  const m = body.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/);
+  if (m) return Math.ceil(Number(m[1]));
+  return 15 * (attempt + 1);
+}
+
+/**
+ * One chat completion. Retries short rate limits, then falls back across the
+ * provider's models and finally across fallback providers (e.g. Gemini → Groq).
+ */
 export async function chat(provider, system, user, { json = false, fetcher = fetch } = {}) {
-  let lastError = null;
-  for (const model of provider.models) {
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const res = await fetcher(provider.url, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${provider.key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          temperature: 0.4,
-          max_tokens: provider.maxTokens,
-          ...(json ? { response_format: { type: 'json_object' } } : {}),
-          messages: [
-            { role: 'system', content: system },
-            { role: 'user', content: user },
-          ],
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const text = data.choices?.[0]?.message?.content;
-        if (typeof text === 'string' && text.trim()) return text;
-        lastError = new Error(`${model}: empty response`);
-        break;
+  const chain = [provider, ...(provider.fallbacks ?? [])];
+  const errors = [];
+  for (const p of chain) {
+    let rejected = false;
+    models: for (const model of p.models) {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const res = await fetcher(p.url, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${p.key}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            temperature: 0.4,
+            max_tokens: p.maxTokens,
+            ...(p.extra ?? {}),
+            ...(json ? { response_format: { type: 'json_object' } } : {}),
+            messages: [
+              { role: 'system', content: system },
+              { role: 'user', content: user },
+            ],
+          }),
+        });
+        const body = await res.text().catch(() => '');
+        if (res.ok) {
+          let data = null;
+          try {
+            data = JSON.parse(body);
+          } catch {
+            errors.push(`${p.name}/${model}: response is not JSON: ${body.slice(0, 120)}`);
+            break;
+          }
+          const text = data?.choices?.[0]?.message?.content;
+          if (typeof text === 'string' && text.trim()) {
+            if (p !== provider) console.log(`  answered by fallback ${p.name}/${model}`);
+            return text;
+          }
+          errors.push(`${p.name}/${model}: empty response (finish_reason: ${data?.choices?.[0]?.finish_reason ?? 'unknown'})`);
+          break;
+        }
+        errors.push(`${p.name}/${model}: HTTP ${res.status} ${body.slice(0, 300)}`);
+        if (res.status === 401 || res.status === 403) {
+          rejected = true;
+          break models; // a bad key fails every model of this provider
+        }
+        if (res.status === 429 && isDailyQuota(body)) {
+          console.log(`  ${p.name}/${model}: daily free quota used up; trying the next option`);
+          break; // waiting will not help today
+        }
+        if (res.status === 429 || res.status >= 500) {
+          const wait = Math.min(retryAfter(res, body, attempt), 60);
+          console.log(`  ${p.name}/${model}: HTTP ${res.status}; retrying in ${wait}s`);
+          await sleep(wait * 1000);
+          continue;
+        }
+        break; // other 4xx (e.g. unknown model): try the next model
       }
-      const body = await res.text().catch(() => '');
-      lastError = new Error(`${model}: HTTP ${res.status} ${body.slice(0, 300)}`);
-      if (res.status === 429 || res.status >= 500) {
-        const wait = Number(res.headers.get('retry-after')) || 10 * (attempt + 1);
-        console.log(`  rate limited or busy; retrying in ${wait}s`);
-        await sleep(Math.min(wait, 60) * 1000);
-        continue;
-      }
-      break; // 4xx other than 429: try the next model
     }
+    if (rejected) console.log(`  ${p.name}: the key was rejected`);
   }
-  throw lastError ?? new Error('model call failed');
+  const all = errors.join('\n');
+  if (errors.every((e) => / HTTP 40[13] /.test(e))) {
+    throw new Error(`The AI key was rejected. Check it in AppNar → Settings → AI.\n${all}`);
+  }
+  if (/HTTP 429/.test(all)) {
+    throw new Error(`The free AI quota is used up for now. Try again later, or add a Groq key as a fallback in AppNar → Settings → AI.\n${all}`);
+  }
+  throw new Error(`Model call failed:\n${all}`);
 }
 
 // ───────────────────────────── parsing helpers ─────────────────────────────
@@ -294,7 +377,7 @@ ${format}`,
   for (let round = 1; !result.ok && round <= MAX_FIX_ROUNDS; round++) {
     const testsOnly = round === MAX_FIX_ROUNDS;
     console.log(`  tests failed; fix round ${round}${testsOnly ? ' (tests only)' : ''}`);
-    await sleep(4000);
+    await pause(provider);
     const fixed = await chat(
       provider,
       rules(spec),
@@ -350,7 +433,7 @@ Answer with exactly two blocks:
   if (!sf['index.html'] || !sf['styles.css']) throw new Error('model did not return index.html and styles.css');
   await write('index.html', sf['index.html']);
   await write('styles.css', sf['styles.css']);
-  await sleep(4000);
+  await pause(provider);
 
   // 2) Behaviour, checked against the markup and the logic exports.
   const ask = (extra = '') =>
@@ -382,7 +465,7 @@ ${tail(sf['index.html'], 5000)}
     if (problems.length === 0) break;
     if (round === MAX_FIX_ROUNDS) throw new Error(`src/app.js still has problems:\n${problems.join('\n')}`);
     console.log(`  app.js problems; fix round ${round}:\n${problems.join('\n')}`);
-    await sleep(4000);
+    await pause(provider);
     appJs = stripFence(await ask(`\n\nYour previous attempt had these problems — fix them:\n${problems.join('\n')}`));
   }
   commit('feat: user interface', ['index.html', 'styles.css', 'src/app.js']);
@@ -506,7 +589,7 @@ async function phaseVerify() {
 
 export async function main(phase) {
   const spec = await loadSpec();
-  const provider = phase === 'verify' ? null : providerFromEnv();
+  const provider = phase === 'verify' ? null : await resolveProvider(spec);
   if (provider) console.log(`AppNar · ${phase} · ${provider.name}`);
   await mkdir(WORK, { recursive: true });
   switch (phase) {
