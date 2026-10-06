@@ -19,6 +19,6 @@ jobs:
         with:
           node-version: 22
       - name: Syntax check
-        run: for f in src/*.js; do [ -f "$f" ] && node --check "$f"; done
+        run: for f in src/*.js; do if [ -f "$f" ]; then node --check "$f"; fi; done
       - name: Unit tests
         run: if ls tests/*.test.js >/dev/null 2>&1; then node --test "tests/*.test.js"; else echo "no tests yet"; fi
