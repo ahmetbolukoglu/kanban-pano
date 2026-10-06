@@ -21,9 +21,9 @@ const MAX_FIX_ROUNDS = 3;
 const PROVIDERS = {
   gemini: {
     url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
-    models: ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.0-flash'],
+    models: ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.5-flash-lite'],
     maxTokens: 16000,
-    extra: { reasoning_effort: 'low' },
+    extra: {},
     gapMs: 6500, // free tier: about 10 requests per minute
   },
   groq: {
@@ -99,6 +99,9 @@ export async function chat(provider, system, user, { json = false, fetcher = fet
   for (const p of chain) {
     let rejected = false;
     models: for (const model of p.models) {
+      // Optional parameters (JSON mode, provider extras) are dropped once if the
+      // provider chokes on them; plain chat completions are the most compatible.
+      let plain = false;
       for (let attempt = 0; attempt < 4; attempt++) {
         const res = await fetcher(p.url, {
           method: 'POST',
@@ -107,8 +110,8 @@ export async function chat(provider, system, user, { json = false, fetcher = fet
             model,
             temperature: 0.4,
             max_tokens: p.maxTokens,
-            ...(p.extra ?? {}),
-            ...(json ? { response_format: { type: 'json_object' } } : {}),
+            ...(plain ? {} : (p.extra ?? {})),
+            ...(json && !plain ? { response_format: { type: 'json_object' } } : {}),
             messages: [
               { role: 'system', content: system },
               { role: 'user', content: user },
@@ -132,7 +135,8 @@ export async function chat(provider, system, user, { json = false, fetcher = fet
           errors.push(`${p.name}/${model}: empty response (finish_reason: ${data?.choices?.[0]?.finish_reason ?? 'unknown'})`);
           break;
         }
-        errors.push(`${p.name}/${model}: HTTP ${res.status} ${body.slice(0, 300)}`);
+        errors.push(`${p.name}/${model}: HTTP ${res.status} ${body.replace(/\s+/g, ' ').slice(0, 300)}`);
+        console.log(`  ${errors.at(-1)}`);
         if (res.status === 401 || res.status === 403) {
           rejected = true;
           break models; // a bad key fails every model of this provider
@@ -141,8 +145,14 @@ export async function chat(provider, system, user, { json = false, fetcher = fet
           console.log(`  ${p.name}/${model}: daily free quota used up; trying the next option`);
           break; // waiting will not help today
         }
+        if (!plain && (res.status === 400 || res.status === 500)) {
+          plain = true;
+          console.log(`  ${p.name}/${model}: retrying without optional parameters`);
+          continue;
+        }
         if (res.status === 429 || res.status >= 500) {
-          const wait = Math.min(retryAfter(res, body, attempt), 60);
+          if (attempt === 3) break;
+          const wait = Math.min(retryAfter(res, body, attempt), 45);
           console.log(`  ${p.name}/${model}: HTTP ${res.status}; retrying in ${wait}s`);
           await sleep(wait * 1000);
           continue;
@@ -610,7 +620,10 @@ export async function main(phase) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv[2]).catch((e) => {
-    console.error(`::error::${e instanceof Error ? e.message : String(e)}`);
+    // Multi-line annotation (GitHub workflow-command escaping) so the whole reason
+    // reaches the run summary and AppNar, not just the first line.
+    const msg = (e instanceof Error ? e.message : String(e)).slice(0, 3000);
+    console.error(`::error title=AppNar ${process.argv[2] ?? ''}::${msg.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')}`);
     process.exit(1);
   });
 }
