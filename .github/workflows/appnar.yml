@@ -13,7 +13,8 @@ on:
 
 concurrency:
   group: appnar-factory
-  cancel-in-progress: false
+  # A newer request (rebuild) replaces a run that is still going.
+  cancel-in-progress: true
 
 permissions:
   contents: write

@@ -18,10 +18,12 @@ const MAX_FIX_ROUNDS = 3;
 
 // ───────────────────────────── model access ─────────────────────────────
 
+// `models` are fallbacks only: the live model list is read at start (see
+// discoverModels), because providers retire model ids every few months.
 const PROVIDERS = {
   gemini: {
     url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
-    models: ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.5-flash-lite'],
+    models: ['gemini-flash-latest', 'gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'],
     maxTokens: 16000,
     extra: {},
     gapMs: 6500, // free tier: about 10 requests per minute
@@ -39,7 +41,58 @@ export function makeProvider(name, key) {
   const def = PROVIDERS[name];
   if (!def) throw new Error(`unknown AI provider "${name}"`);
   if (!key) throw new Error(`no API key for ${name}`);
-  return { name, key, ...def };
+  return { name, key, ...def, models: [...def.models] };
+}
+
+/** "gemini-3.8-flash" → [3, 8]; used to sort model ids newest first. */
+function versionOf(id) {
+  const m = id.match(/(\d+)(?:\.(\d+))?/);
+  return m ? [Number(m[1]), Number(m[2] ?? 0)] : [0, 0];
+}
+
+/**
+ * Picks the best Gemini text models the key can use, newest Flash first, then
+ * Flash-Lite. Skips previews, experiments and image/audio/embedding variants.
+ */
+export function pickGeminiModels(list) {
+  const ok = list
+    .filter((m) => (m.supportedGenerationMethods ?? ['generateContent']).includes('generateContent'))
+    .map((m) => String(m.name ?? '').replace(/^models\//, ''))
+    .filter((id) => /^gemini-[\d.]+-flash(-lite)?$/.test(id));
+  const byVersion = (a, b) => {
+    const [a1, a2] = versionOf(a);
+    const [b1, b2] = versionOf(b);
+    return b1 - a1 || b2 - a2;
+  };
+  const flash = ok.filter((id) => !id.endsWith('-lite')).sort(byVersion);
+  const lite = ok.filter((id) => id.endsWith('-lite')).sort(byVersion);
+  return [...flash.slice(0, 2), ...lite.slice(0, 1)];
+}
+
+/** Puts the models this key can actually use first; keeps the static list as a backstop. */
+export async function discoverModels(provider, fetcher = fetch) {
+  try {
+    if (provider.name === 'gemini') {
+      const res = await fetcher(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${encodeURIComponent(provider.key)}`, {
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!res.ok) return provider;
+      const live = pickGeminiModels((await res.json()).models ?? []);
+      if (live.length) provider.models = [...new Set([...live, ...provider.models])];
+    } else if (provider.name === 'groq') {
+      const res = await fetcher('https://api.groq.com/openai/v1/models', {
+        headers: { Authorization: `Bearer ${provider.key}` },
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!res.ok) return provider;
+      const ids = new Set(((await res.json()).data ?? []).map((m) => m.id));
+      const known = provider.models.filter((id) => ids.has(id));
+      if (known.length) provider.models = known;
+    }
+  } catch {
+    // Discovery is best effort; the static list still works.
+  }
+  return provider;
 }
 
 /**
@@ -98,26 +151,39 @@ export async function chat(provider, system, user, { json = false, fetcher = fet
   const errors = [];
   for (const p of chain) {
     let rejected = false;
-    models: for (const model of p.models) {
+    const models = [...p.models];
+    models: for (let mi = 0; mi < models.length; mi++) {
+      const model = models[mi];
       // Optional parameters (JSON mode, provider extras) are dropped once if the
       // provider chokes on them; plain chat completions are the most compatible.
       let plain = false;
       for (let attempt = 0; attempt < 4; attempt++) {
-        const res = await fetcher(p.url, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${p.key}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            temperature: 0.4,
-            max_tokens: p.maxTokens,
-            ...(plain ? {} : (p.extra ?? {})),
-            ...(json && !plain ? { response_format: { type: 'json_object' } } : {}),
-            messages: [
-              { role: 'system', content: system },
-              { role: 'user', content: user },
-            ],
-          }),
-        });
+        let res;
+        try {
+          res = await fetcher(p.url, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${p.key}`, 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(180_000),
+            body: JSON.stringify({
+              model,
+              temperature: 0.4,
+              max_tokens: p.maxTokens,
+              ...(plain ? {} : (p.extra ?? {})),
+              ...(json && !plain ? { response_format: { type: 'json_object' } } : {}),
+              messages: [
+                { role: 'system', content: system },
+                { role: 'user', content: user },
+              ],
+            }),
+          });
+        } catch (e) {
+          // Network drop or timeout: same treatment as a 5xx.
+          errors.push(`${p.name}/${model}: network error: ${e instanceof Error ? (e.cause?.message ?? e.message) : String(e)}`);
+          console.log(`  ${errors.at(-1)}`);
+          if (attempt === 3) break;
+          await sleep(10_000 * (attempt + 1));
+          continue;
+        }
         const body = await res.text().catch(() => '');
         if (res.ok) {
           let data = null;
@@ -144,6 +210,18 @@ export async function chat(provider, system, user, { json = false, fetcher = fet
         if (res.status === 429 && isDailyQuota(body)) {
           console.log(`  ${p.name}/${model}: daily free quota used up; trying the next option`);
           break; // waiting will not help today
+        }
+        if (res.status === 404) {
+          // Retired model: providers usually name the replacement ("use models/x instead").
+          const suggested = body
+            .match(/models\/[\w.-]+/g)
+            ?.map((s) => s.slice('models/'.length).replace(/\.+$/, ''))
+            .find((id) => id !== model && !models.includes(id));
+          if (suggested) {
+            console.log(`  ${p.name}/${model} is retired; trying ${suggested}`);
+            models.splice(mi + 1, 0, suggested);
+          }
+          break;
         }
         if (!plain && (res.status === 400 || res.status === 500)) {
           plain = true;
@@ -600,7 +678,11 @@ async function phaseVerify() {
 export async function main(phase) {
   const spec = await loadSpec();
   const provider = phase === 'verify' ? null : await resolveProvider(spec);
-  if (provider) console.log(`AppNar · ${phase} · ${provider.name}`);
+  if (provider) {
+    for (const p of [provider, ...(provider.fallbacks ?? [])]) await discoverModels(p);
+    const chain = [provider, ...(provider.fallbacks ?? [])].map((p) => `${p.name} (${p.models.join(', ')})`).join(' → ');
+    console.log(`AppNar · ${phase} · ${chain}`);
+  }
   await mkdir(WORK, { recursive: true });
   switch (phase) {
     case 'plan':
